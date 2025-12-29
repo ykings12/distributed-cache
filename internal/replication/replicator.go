@@ -2,84 +2,125 @@ package replication
 
 import (
 	"bytes"
-	"distributed-cache/internal/logs"
-	"distributed-cache/internal/store"
+	"context"
 	"encoding/json"
 	"net/http"
-	"time"
+
+	"distributed-cache/internal/logs"
+	"distributed-cache/internal/peers"
+	"distributed-cache/internal/store"
 )
 
-// Replicator handles replication of cache entries across distributed nodes
+// Replicator handles reliable, health-aware replication of writes.
 type Replicator struct {
-	nodeID string       // ID of the current node
-	peers  []string     // IDs of peer nodes
-	logger *logs.Logger // shared Logger instance for replication events
-	client *http.Client // HTTP client for replication requests
+	nodeID string
+
+	peers  *peers.PeerManager
+	config peers.PeerConfig
+
+	logger *logs.Logger
+	client *http.Client
 }
 
-// NewReplicator creates a new Replicator instance
+// NewReplicator creates a replication engine integrated with
+// peer health tracking and retry policies.
 func NewReplicator(
 	nodeID string,
-	peers []string,
+	peerManager *peers.PeerManager,
+	cfg peers.PeerConfig,
 	logger *logs.Logger,
 ) *Replicator {
 	return &Replicator{
 		nodeID: nodeID,
-		peers:  peers,
+		peers:  peerManager,
+		config: cfg,
 		logger: logger,
 		client: &http.Client{
-			Timeout: 2 * time.Second,
+			Timeout: cfg.Timeout.ReplicationTimeout,
 		},
 	}
 }
 
-//Replicate sends the given key and entry to all peer nodes asynchronously
-//Behavior:
-//1. Does not block the caller
-//2. Spawns a goroutine for each peer to handle replication
-
-// this method is called after the local write is successful
-func (r *Replicator) Replicate(key string, entry store.Entry) {
+// Replicate sends a cache write to all healthy peers asynchronously.
+// Replication is retry-aware, cancellable, and updates peer health.
+func (r *Replicator) Replicate(
+	ctx context.Context,
+	key string,
+	entry store.Entry,
+) {
 	payload := Payload{
 		Key:            key,
 		Entry:          entry,
 		OriginalNodeID: r.nodeID,
 	}
 
-	for _, peer := range r.peers {
-		peer := peer //capture range variable
-		go r.sendToPeer(peer, payload)
+	for _, peer := range r.peers.GetPeers() {
+
+		// Skip unhealthy peers
+		if !r.peers.IsHealthy(peer) {
+			r.logger.Debug("skipping unhealthy peer " + peer)
+			continue
+		}
+
+		peer := peer // capture loop variable
+		go r.sendWithRetry(ctx, peer, payload)
 	}
 }
 
-func (r *Replicator) sendToPeer(peer string, payload Payload) {
-	body, err := json.Marshal(payload)
+// sendWithRetry performs replication using the Retry engine
+// and updates peer health based on the final outcome.
+func (r *Replicator) sendWithRetry(
+	ctx context.Context,
+	peer string,
+	payload Payload,
+) {
+	err := peers.Retry(ctx, r.config.Retry, func() error {
+		return r.sendOnce(ctx, peer, payload)
+	})
+
 	if err != nil {
-		r.logger.Error("Failed to marshal payload for replication to peer")
+		r.peers.MarkFailure(peer)
+		r.logger.Warn("replication failed to peer " + peer)
 		return
 	}
 
-	req, err := http.NewRequest(
+	r.peers.MarkSuccess(peer)
+	r.logger.Debug("replication succeeded to peer " + peer)
+}
+
+// sendOnce performs a single HTTP replication attempt.
+// It returns an error so Retry() can decide what to do.
+func (r *Replicator) sendOnce(
+	ctx context.Context,
+	peer string,
+	payload Payload,
+) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
 		http.MethodPost,
 		peer+"/internal/replicate",
 		bytes.NewBuffer(body),
 	)
 	if err != nil {
-		r.logger.Error("Failed to create replication request to peer: " + peer)
-		return
+		return err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		r.logger.Error("Failed to send replication request to peer: " + peer)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent {
-		r.logger.Warn("unexpected response from peer " + peer + " during replication: " + resp.Status)
+		return http.ErrHandlerTimeout // treated as retryable
 	}
-	r.logger.Debug("replicated key " + payload.Key + " to peer " + peer)
+
+	return nil
 }

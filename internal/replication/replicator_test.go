@@ -1,96 +1,192 @@
 package replication
 
 import (
-	"distributed-cache/internal/logs"
-	"distributed-cache/internal/store"
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"distributed-cache/internal/logs"
+	"distributed-cache/internal/peers"
+	"distributed-cache/internal/store"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestReplicator(t *testing.T) {
-	// Helper to create a fresh logger for each subtest
-	newTestLogger := func() *logs.Logger {
-		return logs.NewLogger(100, logs.DEBUG)
+func TestReplicator_HealthyPeer_ReplicationSucceeds(t *testing.T) {
+	var calls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := peers.DefaultPeerConfig()
+	pm := peers.NewPeerManager(cfg)
+	pm.AddPeer(server.URL)
+
+	logger := logs.NewLogger(10, logs.DEBUG)
+	replicator := NewReplicator("node-A", pm, cfg, logger)
+
+	replicator.Replicate(context.Background(), "key", store.Entry{
+		Value:     "val",
+		Timestamp: 1,
+	})
+
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt32(&calls) == 1
+	}, time.Second, 10*time.Millisecond)
+
+	assert.True(t, pm.IsHealthy(server.URL))
+}
+
+func TestReplicator_UnhealthyPeer_IsSkipped(t *testing.T) {
+	var calls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := peers.DefaultPeerConfig()
+	cfg.Health.FailureThreshold = 1
+
+	pm := peers.NewPeerManager(cfg)
+	pm.AddPeer(server.URL)
+
+	// Make peer unhealthy
+	pm.MarkFailure(server.URL)
+
+	logger := logs.NewLogger(10, logs.DEBUG)
+	replicator := NewReplicator("node-A", pm, cfg, logger)
+
+	replicator.Replicate(context.Background(), "key", store.Entry{
+		Value:     "val",
+		Timestamp: 1,
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&calls))
+}
+
+func TestReplicator_RetryThenSuccess(t *testing.T) {
+	var calls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := peers.DefaultPeerConfig()
+	cfg.Retry.MaxRetries = 2
+	cfg.Retry.BaseBackoff = 1 * time.Millisecond
+	cfg.Retry.JitterFn = func(d time.Duration) time.Duration { return 0 }
+
+	pm := peers.NewPeerManager(cfg)
+	pm.AddPeer(server.URL)
+
+	logger := logs.NewLogger(10, logs.DEBUG)
+	replicator := NewReplicator("node-A", pm, cfg, logger)
+
+	replicator.Replicate(context.Background(), "key", store.Entry{
+		Value:     "val",
+		Timestamp: 1,
+	})
+
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt32(&calls) >= 2
+	}, time.Second, 10*time.Millisecond)
+
+	assert.True(t, pm.IsHealthy(server.URL))
+}
+
+func TestReplicator_RetryExhaustion_MarksUnhealthy(t *testing.T) {
+	var calls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := peers.DefaultPeerConfig()
+	cfg.Health.FailureThreshold = 1
+	cfg.Retry.MaxRetries = 1
+	cfg.Retry.BaseBackoff = 1 * time.Millisecond
+	cfg.Retry.JitterFn = func(d time.Duration) time.Duration { return 0 }
+
+	pm := peers.NewPeerManager(cfg)
+	pm.AddPeer(server.URL)
+
+	logger := logs.NewLogger(10, logs.DEBUG)
+	replicator := NewReplicator("node-A", pm, cfg, logger)
+
+	replicator.Replicate(context.Background(), "key", store.Entry{
+		Value:     "val",
+		Timestamp: 1,
+	})
+
+	assert.Eventually(t, func() bool {
+		return !pm.IsHealthy(server.URL)
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestReplicator_ContextCancelled_NoRetry(t *testing.T) {
+	var calls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := peers.DefaultPeerConfig()
+	cfg.Retry.MaxRetries = 5
+	cfg.Retry.BaseBackoff = 10 * time.Millisecond
+
+	pm := peers.NewPeerManager(cfg)
+	pm.AddPeer(server.URL)
+
+	logger := logs.NewLogger(10, logs.DEBUG)
+	replicator := NewReplicator("node-A", pm, cfg, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	replicator.Replicate(ctx, "key", store.Entry{
+		Value:     "val",
+		Timestamp: 1,
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	assert.LessOrEqual(t, atomic.LoadInt32(&calls), int32(1))
+}
+
+func TestSendOnce_RequestCreationError(t *testing.T) {
+	cfg := peers.DefaultPeerConfig()
+	pm := peers.NewPeerManager(cfg)
+
+	logger := logs.NewLogger(10, logs.DEBUG)
+	r := NewReplicator("node-A", pm, cfg, logger)
+
+	payload := Payload{
+		Key: "key",
+		Entry: store.Entry{
+			Value: "value",
+		},
+		OriginalNodeID: "node-A",
 	}
 
-	t.Run("SendsReplicationRequest", func(t *testing.T) {
-		logger := newTestLogger()
-		var received bool
-		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			received = true
-			w.WriteHeader(http.StatusNoContent)
-		}))
-		defer peerServer.Close()
+	err := r.sendOnce(context.Background(), "http://\n", payload)
 
-		replicator := NewReplicator("node-A", []string{peerServer.URL}, logger)
-		replicator.Replicate("key1", store.Entry{Value: "hello", Timestamp: 123})
-
-		assert.Eventually(t, func() bool { return received }, 1*time.Second, 10*time.Millisecond)
-	})
-
-	t.Run("NoPeers", func(t *testing.T) {
-		logger := newTestLogger() // Fresh logger!
-		replicator := NewReplicator("node-A", []string{}, logger)
-		replicator.Replicate("key2", store.Entry{Value: "world"})
-
-		assert.Len(t, logger.GetLast(10), 0)
-	})
-
-	t.Run("PeerReturns500", func(t *testing.T) {
-		logger := newTestLogger()
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusInternalServerError)
-		}))
-		defer server.Close()
-
-		replicator := NewReplicator("node-A", []string{server.URL}, logger)
-		replicator.Replicate("test-key", store.Entry{Value: "v"})
-
-		time.Sleep(100 * time.Millisecond)
-
-		// Check all logs, not just the last one
-		found := false
-		for _, entry := range logger.GetLast(10) {
-			if entry.Level == logs.WARN {
-				found = true
-				assert.Contains(t, entry.Message, "unexpected response")
-			}
-		}
-		assert.True(t, found, "Expected a Warning log for 500 error")
-	})
-
-	t.Run("InvalidURL", func(t *testing.T) {
-		logger := newTestLogger()
-		// Control characters like \x7f make NewRequest fail immediately
-		replicator := NewReplicator("node-A", []string{"http://localhost:8080/\x7f"}, logger)
-		replicator.Replicate("test-key", store.Entry{Value: "v"})
-
-		time.Sleep(100 * time.Millisecond)
-		logs := logger.GetLast(10)
-		assert.NotEmpty(t, logs)
-		assert.Contains(t, logs[0].Message, "Failed to create replication request")
-	})
-
-	t.Run("NetworkCallFailure", func(t *testing.T) {
-		logger := newTestLogger()
-		// Use a non-existent local port
-		replicator := NewReplicator("node-A", []string{"http://localhost:12345"}, logger)
-
-		replicator.Replicate("fail-key", store.Entry{Value: "v"})
-
-		// Use Eventually instead of Sleep to ensure the goroutine finished
-		assert.Eventually(t, func() bool {
-			entries := logger.GetLast(10)
-			for _, e := range entries {
-				if e.Level == logs.ERROR && assert.Contains(t, e.Message, "Failed to send") {
-					return true
-				}
-			}
-			return false
-		}, 1*time.Second, 10*time.Millisecond, "Should have logged a network send error")
-	})
+	assert.Error(t, err)
 }
