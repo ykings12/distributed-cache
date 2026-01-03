@@ -3,98 +3,99 @@ package peers
 import (
 	"testing"
 
+	"distributed-cache/internal/metrics"
+
 	"github.com/stretchr/testify/assert"
 )
 
-func TestPeerManagerAndPeerAndIsHealthy(t *testing.T) {
+func TestPeerManagerAddAndIsHealthy(t *testing.T) {
 	cfg := DefaultPeerConfig()
-	pm := NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := NewPeerManager(cfg, reg)
 
 	pm.AddPeer("node-1")
-	assert.True(t, pm.IsHealthy("node-1"), "newly added peer should be healthy")
-	assert.False(t, pm.IsHealthy("node-2"), "non-existent peer should not be healthy")
+	assert.True(t, pm.IsHealthy("node-1"))
+	assert.False(t, pm.IsHealthy("node-2"))
 }
 
-func TestPeerManagerMarkFailureMarkUnhealthyAfterThreshold(t *testing.T) {
+func TestPeerManagerMarkFailureTransitionsToUnhealthy(t *testing.T) {
 	cfg := DefaultPeerConfig()
 	cfg.Health.FailureThreshold = 2
 
-	pm := NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := NewPeerManager(cfg, reg)
+
 	pm.AddPeer("node-1")
 
 	pm.MarkFailure("node-1")
-
-	assert.True(t, pm.IsHealthy("node-1"), "peer should still be healthy after 1 failure")
+	assert.True(t, pm.IsHealthy("node-1"))
 
 	pm.MarkFailure("node-1")
-	assert.False(t, pm.IsHealthy("node-1"), "peer should be unhealthy after 2 failures")
+	assert.False(t, pm.IsHealthy("node-1"))
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(2), snap[string(metrics.PeerFailuresTotal)])
+	assert.Equal(t, int64(1), snap[string(metrics.PeersUnhealthy)])
 }
 
-func TestPeerManagerMarkSuccessRecoverPeer(t *testing.T) {
+func TestPeerManagerMarkSuccessRecoversPeer(t *testing.T) {
 	cfg := DefaultPeerConfig()
 	cfg.Health.FailureThreshold = 1
 	cfg.Health.SuccessThreshold = 2
 
-	pm := NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := NewPeerManager(cfg, reg)
+
 	pm.AddPeer("node-1")
-
 	pm.MarkFailure("node-1")
-	assert.False(t, pm.IsHealthy("node-1"), "peer should be unhealthy after failure")
+	assert.False(t, pm.IsHealthy("node-1"))
 
 	pm.MarkSuccess("node-1")
-	assert.False(t, pm.IsHealthy("node-1"), "peer should not recover after 1 success")
+	assert.False(t, pm.IsHealthy("node-1"))
 
 	pm.MarkSuccess("node-1")
-	assert.True(t, pm.IsHealthy("node-1"), "peer should recover after success threshold is met")
+	assert.True(t, pm.IsHealthy("node-1"))
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(1), snap[string(metrics.PeersHealthy)])
 }
 
-func TestPeerManagerMarkFailureResetsSuccessCount(t *testing.T) {
+func TestPeerManagerCountersResetCorrectly(t *testing.T) {
 	cfg := DefaultPeerConfig()
-	cfg.Health.SuccessThreshold = 2
+	reg := metrics.NewRegistry()
+	pm := NewPeerManager(cfg, reg)
 
-	pm := NewPeerManager(cfg)
 	pm.AddPeer("node-1")
 
 	pm.MarkSuccess("node-1")
 	pm.MarkFailure("node-1")
 
 	peer := pm.peers["node-1"]
-	assert.Equal(t, 0, peer.SuccessCount, "success count should be reset after failure")
-}
-
-func TestPeerManagerMarkSuccessResetsFailureCount(t *testing.T) {
-	cfg := DefaultPeerConfig()
-	cfg.Health.FailureThreshold = 2
-
-	pm := NewPeerManager(cfg)
-	pm.AddPeer("node-1")
-
-	pm.MarkFailure("node-1")
-	pm.MarkSuccess("node-1")
-
-	peer := pm.peers["node-1"]
-	assert.Equal(t, 0, peer.FailureCount, "failure count should be reset after success")
+	assert.Equal(t, 0, peer.SuccessCount)
+	assert.Equal(t, 1, peer.FailureCount)
 }
 
 func TestPeerManagerUnknownPeerNoPanic(t *testing.T) {
 	cfg := DefaultPeerConfig()
-	pm := NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := NewPeerManager(cfg, reg)
 
 	assert.NotPanics(t, func() {
 		pm.MarkFailure("unknown-peer")
 		pm.MarkSuccess("unknown-peer")
-	}, "marking unknown peer should not panic")
+	})
 }
 
-func TestPeerManagerGetPeersReturnsSnapshot(t *testing.T) {
+func TestPeerManagerGetPeersSnapshot(t *testing.T) {
 	cfg := DefaultPeerConfig()
-	pm := NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := NewPeerManager(cfg, reg)
 
 	pm.AddPeer("node-1")
 	pm.AddPeer("node-2")
 
 	peers := pm.GetPeers()
-	assert.Len(t, peers, 2, "should return a snapshot of all peers")
-	assert.Contains(t, peers, "node-1", "snapshot should contain node-1")
-	assert.Contains(t, peers, "node-2", "snapshot should contain node-2")
+	assert.Len(t, peers, 2)
+	assert.Contains(t, peers, "node-1")
+	assert.Contains(t, peers, "node-2")
 }

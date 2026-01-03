@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"distributed-cache/internal/logs"
+	"distributed-cache/internal/metrics"
 	"distributed-cache/internal/peers"
 	"distributed-cache/internal/store"
 
@@ -25,11 +26,13 @@ func TestReplicator_HealthyPeer_ReplicationSucceeds(t *testing.T) {
 	defer server.Close()
 
 	cfg := peers.DefaultPeerConfig()
-	pm := peers.NewPeerManager(cfg)
+
+	reg := metrics.NewRegistry()
+	pm := peers.NewPeerManager(cfg, reg)
 	pm.AddPeer(server.URL)
 
 	logger := logs.NewLogger(10, logs.DEBUG)
-	replicator := NewReplicator("node-A", pm, cfg, logger)
+	replicator := NewReplicator("node-A", pm, cfg, logger, reg)
 
 	replicator.Replicate(context.Background(), "key", store.Entry{
 		Value:     "val",
@@ -41,6 +44,10 @@ func TestReplicator_HealthyPeer_ReplicationSucceeds(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	assert.True(t, pm.IsHealthy(server.URL))
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(1), snap[string(metrics.ReplicationAttemptsTotal)])
+	assert.Equal(t, int64(1), snap[string(metrics.ReplicationSuccessTotal)])
 }
 
 func TestReplicator_UnhealthyPeer_IsSkipped(t *testing.T) {
@@ -55,14 +62,13 @@ func TestReplicator_UnhealthyPeer_IsSkipped(t *testing.T) {
 	cfg := peers.DefaultPeerConfig()
 	cfg.Health.FailureThreshold = 1
 
-	pm := peers.NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := peers.NewPeerManager(cfg, reg)
 	pm.AddPeer(server.URL)
-
-	// Make peer unhealthy
-	pm.MarkFailure(server.URL)
+	pm.MarkFailure(server.URL) // force unhealthy
 
 	logger := logs.NewLogger(10, logs.DEBUG)
-	replicator := NewReplicator("node-A", pm, cfg, logger)
+	replicator := NewReplicator("node-A", pm, cfg, logger, reg)
 
 	replicator.Replicate(context.Background(), "key", store.Entry{
 		Value:     "val",
@@ -71,6 +77,9 @@ func TestReplicator_UnhealthyPeer_IsSkipped(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, int32(0), atomic.LoadInt32(&calls))
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(0), snap[string(metrics.ReplicationAttemptsTotal)])
 }
 
 func TestReplicator_RetryThenSuccess(t *testing.T) {
@@ -91,11 +100,12 @@ func TestReplicator_RetryThenSuccess(t *testing.T) {
 	cfg.Retry.BaseBackoff = 1 * time.Millisecond
 	cfg.Retry.JitterFn = func(d time.Duration) time.Duration { return 0 }
 
-	pm := peers.NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := peers.NewPeerManager(cfg, reg)
 	pm.AddPeer(server.URL)
 
 	logger := logs.NewLogger(10, logs.DEBUG)
-	replicator := NewReplicator("node-A", pm, cfg, logger)
+	replicator := NewReplicator("node-A", pm, cfg, logger, reg)
 
 	replicator.Replicate(context.Background(), "key", store.Entry{
 		Value:     "val",
@@ -107,6 +117,10 @@ func TestReplicator_RetryThenSuccess(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	assert.True(t, pm.IsHealthy(server.URL))
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(1), snap[string(metrics.ReplicationSuccessTotal)])
+	assert.GreaterOrEqual(t, snap[string(metrics.ReplicationRetriesTotal)], int64(1))
 }
 
 func TestReplicator_RetryExhaustion_MarksUnhealthy(t *testing.T) {
@@ -124,11 +138,12 @@ func TestReplicator_RetryExhaustion_MarksUnhealthy(t *testing.T) {
 	cfg.Retry.BaseBackoff = 1 * time.Millisecond
 	cfg.Retry.JitterFn = func(d time.Duration) time.Duration { return 0 }
 
-	pm := peers.NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := peers.NewPeerManager(cfg, reg)
 	pm.AddPeer(server.URL)
 
 	logger := logs.NewLogger(10, logs.DEBUG)
-	replicator := NewReplicator("node-A", pm, cfg, logger)
+	replicator := NewReplicator("node-A", pm, cfg, logger, reg)
 
 	replicator.Replicate(context.Background(), "key", store.Entry{
 		Value:     "val",
@@ -138,6 +153,9 @@ func TestReplicator_RetryExhaustion_MarksUnhealthy(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return !pm.IsHealthy(server.URL)
 	}, time.Second, 10*time.Millisecond)
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(1), snap[string(metrics.ReplicationFailureTotal)])
 }
 
 func TestReplicator_ContextCancelled_NoRetry(t *testing.T) {
@@ -153,14 +171,15 @@ func TestReplicator_ContextCancelled_NoRetry(t *testing.T) {
 	cfg.Retry.MaxRetries = 5
 	cfg.Retry.BaseBackoff = 10 * time.Millisecond
 
-	pm := peers.NewPeerManager(cfg)
+	reg := metrics.NewRegistry()
+	pm := peers.NewPeerManager(cfg, reg)
 	pm.AddPeer(server.URL)
 
 	logger := logs.NewLogger(10, logs.DEBUG)
-	replicator := NewReplicator("node-A", pm, cfg, logger)
+	replicator := NewReplicator("node-A", pm, cfg, logger, reg)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	cancel()
 
 	replicator.Replicate(ctx, "key", store.Entry{
 		Value:     "val",
@@ -173,10 +192,12 @@ func TestReplicator_ContextCancelled_NoRetry(t *testing.T) {
 
 func TestSendOnce_RequestCreationError(t *testing.T) {
 	cfg := peers.DefaultPeerConfig()
-	pm := peers.NewPeerManager(cfg)
+
+	reg := metrics.NewRegistry()
+	pm := peers.NewPeerManager(cfg, reg)
 
 	logger := logs.NewLogger(10, logs.DEBUG)
-	r := NewReplicator("node-A", pm, cfg, logger)
+	r := NewReplicator("node-A", pm, cfg, logger, reg)
 
 	payload := Payload{
 		Key: "key",
@@ -187,6 +208,5 @@ func TestSendOnce_RequestCreationError(t *testing.T) {
 	}
 
 	err := r.sendOnce(context.Background(), "http://\n", payload)
-
 	assert.Error(t, err)
 }

@@ -31,6 +31,11 @@ const (
 	PeersHealthy      MetricKey = "peers_healthy"
 	PeersUnhealthy    MetricKey = "peers_unhealthy"
 	PeerFailuresTotal MetricKey = "peer_failures_total"
+
+	// Heartbeat metrics
+	HeartbeatRunsTotal     MetricKey = "heartbeat_runs_total"
+	HeartbeatSuccessTotal  MetricKey = "heartbeat_success_total"
+	HeartbeatFailuresTotal MetricKey = "heartbeat_failures_total"
 )
 
 // Registry stores all metrics.

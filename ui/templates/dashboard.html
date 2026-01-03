@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Distributed Cache – Health Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- Auto refresh page-level data -->
+    <meta http-equiv="refresh" content="5">
+</head>
+
+<body>
+<div class="container">
+
+    <h1>Distributed Cache – Health Dashboard</h1>
+
+    {% if health.error %}
+        <div class="error">Backend error: {{ health.error }}</div>
+    {% else %}
+        <div class="status {{ health.overall_status | lower }}">
+            Status: {{ health.overall_status }}
+        </div>
+
+        <p class="summary">{{ health.summary }}</p>
+
+        <h3>Signals</h3>
+        <ul>
+            {% for s in health.signals or [] %}
+                <li>{{ s }}</li>
+            {% else %}
+                <li>None</li>
+            {% endfor %}
+        </ul>
+
+        <h3>Recommendations</h3>
+        <ul>
+            {% for r in health.recommendations or [] %}
+                <li>{{ r }}</li>
+            {% else %}
+                <li>None</li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+
+    <hr>
+
+    <!-- ================= PEER HEALTH ================= -->
+
+    <h2>Peer Health</h2>
+
+    {% if peers.error %}
+        <div class="error">{{ peers.error }}</div>
+    {% else %}
+        <table>
+            <tr>
+                <th>Peer</th>
+                <th>Status</th>
+                <th>Failures</th>
+                <th>Successes</th>
+            </tr>
+
+            {% for p in peers or [] %}
+            <tr class="{{ p.state | lower }}">
+                <td>{{ p.address }}</td>
+                <td>{{ p.state }}</td>
+                <td>{{ p.failure_count }}</td>
+                <td>{{ p.success_count }}</td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="4">No peers registered</td>
+            </tr>
+            {% endfor %}
+        </table>
+    {% endif %}
+
+    <hr>
+
+    <!-- ================= METRICS ================= -->
+
+    <h2>Metrics</h2>
+
+    {% if metrics.error %}
+        <div class="error">Metrics error: {{ metrics.error }}</div>
+    {% else %}
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            {% for key, value in metrics.items() %}
+            <tr>
+                <td>{{ key }}</td>
+                <td>{{ value }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    {% endif %}
+
+    <hr>
+
+    <!-- ================= TRENDS (PHASE 9.3) ================= -->
+
+    <h2>Trends</h2>
+
+    <canvas id="replicationChart" height="100"></canvas>
+    <br>
+    <canvas id="heartbeatChart" height="100"></canvas>
+
+    <p class="refresh-note">Auto-refresh every 5 seconds</p>
+
+</div>
+
+<!-- ================= JAVASCRIPT ================= -->
+
+<script>
+let metricHistory = [];
+const MAX_POINTS = 20;
+
+/* Fetch metrics snapshot */
+async function fetchMetrics() {
+    try {
+        const resp = await fetch("/metrics");
+        const data = await resp.json();
+
+        metricHistory.push({
+            time: new Date().toLocaleTimeString(),
+            metrics: data
+        });
+
+        if (metricHistory.length > MAX_POINTS) {
+            metricHistory.shift();
+        }
+    } catch (e) {
+        console.error("Failed to fetch metrics", e);
+    }
+}
+
+/* ---------------- Replication Chart ---------------- */
+
+const replicationCtx = document.getElementById("replicationChart").getContext("2d");
+const replicationChart = new Chart(replicationCtx, {
+    type: "line",
+    data: {
+        labels: [],
+        datasets: [
+            {
+                label: "Replication Success",
+                data: [],
+                borderColor: "green",
+                tension: 0.3
+            },
+            {
+                label: "Replication Retries",
+                data: [],
+                borderColor: "orange",
+                tension: 0.3
+            },
+            {
+                label: "Replication Failures",
+                data: [],
+                borderColor: "red",
+                tension: 0.3
+            }
+        ]
+    }
+});
+
+function updateReplicationChart() {
+    replicationChart.data.labels = metricHistory.map(p => p.time);
+    replicationChart.data.datasets[0].data =
+        metricHistory.map(p => p.metrics["replication_success_total"] || 0);
+    replicationChart.data.datasets[1].data =
+        metricHistory.map(p => p.metrics["replication_retries_total"] || 0);
+    replicationChart.data.datasets[2].data =
+        metricHistory.map(p => p.metrics["replication_failure_total"] || 0);
+    replicationChart.update();
+}
+
+/* ---------------- Heartbeat Chart ---------------- */
+
+const heartbeatCtx = document.getElementById("heartbeatChart").getContext("2d");
+const heartbeatChart = new Chart(heartbeatCtx, {
+    type: "line",
+    data: {
+        labels: [],
+        datasets: [
+            {
+                label: "Heartbeat Failures",
+                data: [],
+                borderColor: "red",
+                tension: 0.3
+            }
+        ]
+    }
+});
+
+function updateHeartbeatChart() {
+    heartbeatChart.data.labels = metricHistory.map(p => p.time);
+    heartbeatChart.data.datasets[0].data =
+        metricHistory.map(p => p.metrics["heartbeat_failures_total"] || 0);
+    heartbeatChart.update();
+}
+
+/* ---------------- Auto update loop ---------------- */
+
+(async function initCharts() {
+    await fetchMetrics();
+    updateReplicationChart();
+    updateHeartbeatChart();
+
+    setInterval(async () => {
+        await fetchMetrics();
+        updateReplicationChart();
+        updateHeartbeatChart();
+    }, 5000);
+})();
+</script>
+
+</body>
+</html>

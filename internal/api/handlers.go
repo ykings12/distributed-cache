@@ -1,25 +1,42 @@
 package api
 
 import (
-	"distributed-cache/internal/store"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
+
+	"distributed-cache/internal/ai"
+	"distributed-cache/internal/logs"
+	"distributed-cache/internal/metrics"
+	"distributed-cache/internal/peers"
+	"distributed-cache/internal/store"
 )
 
-// Handler holds the dependencies for the HTTP handlers
+// Handler holds dependencies for HTTP handlers.
 type Handler struct {
-	store *store.Store
+	store    *store.Store
+	metrics  *metrics.Registry
+	analyzer *ai.HealthAnalyzer
+	peers    *peers.PeerManager
 }
 
-func NewHandler(store *store.Store) *Handler {
+// NewHandler creates a new API handler.
+func NewHandler(
+	store *store.Store,
+	metrics *metrics.Registry,
+	logger *logs.Logger,
+	peers *peers.PeerManager,
+) *Handler {
 	return &Handler{
-		store: store,
+		store:    store,
+		metrics:  metrics,
+		analyzer: ai.NewHealthAnalyzer(metrics, logger),
+		peers:    peers,
 	}
 }
 
-//PUT /kv/{key}
+/* ---------------- PUT /kv/{key} ---------------- */
 
 type setRequest struct {
 	Value string `json:"value"`
@@ -52,7 +69,7 @@ func (h *Handler) SetKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-//GET /kv/{key}
+/* ---------------- GET /kv/{key} ---------------- */
 
 func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
@@ -67,14 +84,15 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]string{"value": value})
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"value": value,
+	})
 }
 
-//DELETE /kv/{key}
+/* ---------------- DELETE /kv/{key} ---------------- */
 
 func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
-
 	if key == "" {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
@@ -82,10 +100,9 @@ func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request) {
 
 	h.store.Delete(key)
 	w.WriteHeader(http.StatusNoContent)
-
 }
 
-//GET /admin/keys
+/* ---------------- GET /admin/keys ---------------- */
 
 func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	entries := h.store.List()
@@ -96,5 +113,19 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(resp)
+}
 
+/* ---------------- GET /metrics ---------------- */
+
+func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.metrics.Snapshot())
+}
+
+/* ---------------- GET /health ---------------- */
+
+func (h *Handler) GetHealth(w http.ResponseWriter, r *http.Request) {
+	report := h.analyzer.Analyze()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
 }

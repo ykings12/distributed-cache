@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"time"
@@ -44,7 +45,7 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-//ResponseWriter wrapper
+// ResponseWriter wrapper
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -53,4 +54,10 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// GET /admin/peers
+func (h *Handler) GetPeers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.peers.Snapshot())
 }

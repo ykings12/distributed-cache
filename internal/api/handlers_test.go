@@ -2,34 +2,45 @@ package api
 
 import (
 	"bytes"
-	"distributed-cache/internal/store"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"distributed-cache/internal/logs"
+	"distributed-cache/internal/metrics"
+	"distributed-cache/internal/store"
+
 	"github.com/stretchr/testify/assert"
 )
 
 func setUpTestServer() *httptest.Server {
-	st := store.NewStore()
-	h := NewHandler(st)
+	reg := metrics.NewRegistry()
+	logger := logs.NewLogger(50, logs.DEBUG)
+	st := store.NewStore(reg)
+
+	h := NewHandler(st, reg, logger)
+
 	mux := http.NewServeMux()
 	handler := RegisterRoutes(mux, h)
+
 	return httptest.NewServer(handler)
 }
+
+/* ---------------- PUT /kv ---------------- */
 
 func TestSetKey(t *testing.T) {
 	server := setUpTestServer()
 	defer server.Close()
+
 	client := &http.Client{}
 
 	t.Run("ValidRequest", func(t *testing.T) {
 		body := []byte(`{"value":"hello"}`)
 		req, _ := http.NewRequest(http.MethodPut, server.URL+"/kv/key1", bytes.NewBuffer(body))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
 
+		resp, err := client.Do(req)
 		assert.NoError(t, err)
 		assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	})
@@ -37,8 +48,8 @@ func TestSetKey(t *testing.T) {
 	t.Run("WithTTL", func(t *testing.T) {
 		body := []byte(`{"value":"expiring", "ttl_ms": 100}`)
 		req, _ := http.NewRequest(http.MethodPut, server.URL+"/kv/ttl-key", bytes.NewBuffer(body))
-		resp, err := client.Do(req)
 
+		resp, err := client.Do(req)
 		assert.NoError(t, err)
 		assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	})
@@ -60,11 +71,12 @@ func TestSetKey(t *testing.T) {
 	})
 }
 
+/* ---------------- GET /kv ---------------- */
+
 func TestGetKey(t *testing.T) {
 	server := setUpTestServer()
 	defer server.Close()
 
-	// Pre-seed a key for the valid test
 	body := []byte(`{"value":"found-me"}`)
 	req, _ := http.NewRequest(http.MethodPut, server.URL+"/kv/active-key", bytes.NewBuffer(body))
 	http.DefaultClient.Do(req)
@@ -93,12 +105,13 @@ func TestGetKey(t *testing.T) {
 	})
 }
 
+/* ---------------- DELETE /kv ---------------- */
+
 func TestDeleteKey(t *testing.T) {
 	server := setUpTestServer()
 	defer server.Close()
 
 	t.Run("SuccessfulDelete", func(t *testing.T) {
-		// Set then delete
 		reqSet, _ := http.NewRequest(http.MethodPut, server.URL+"/kv/to-delete", bytes.NewBuffer([]byte(`{"value":"x"}`)))
 		http.DefaultClient.Do(reqSet)
 
@@ -118,6 +131,8 @@ func TestDeleteKey(t *testing.T) {
 	})
 }
 
+/* ---------------- GET /admin/keys ---------------- */
+
 func TestListKeys(t *testing.T) {
 	server := setUpTestServer()
 	defer server.Close()
@@ -129,11 +144,10 @@ func TestListKeys(t *testing.T) {
 
 		var data map[string]string
 		json.NewDecoder(resp.Body).Decode(&data)
-		assert.Equal(t, 0, len(data))
+		assert.Len(t, data, 0)
 	})
 
 	t.Run("WithData", func(t *testing.T) {
-		// Add data using PUT
 		req, _ := http.NewRequest(http.MethodPut, server.URL+"/kv/a", bytes.NewBuffer([]byte(`{"value":"1"}`)))
 		http.DefaultClient.Do(req)
 
@@ -142,22 +156,60 @@ func TestListKeys(t *testing.T) {
 
 		var data map[string]string
 		json.NewDecoder(resp.Body).Decode(&data)
-		assert.True(t, len(data) >= 1)
 		assert.Equal(t, "1", data["a"])
 		resp.Body.Close()
 	})
 }
+
+/* ---------------- GET /metrics ---------------- */
+
+func TestGetMetrics(t *testing.T) {
+	server := setUpTestServer()
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/metrics")
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var data map[string]int64
+	err = json.NewDecoder(resp.Body).Decode(&data)
+	assert.NoError(t, err)
+	assert.NotNil(t, data)
+
+	resp.Body.Close()
+}
+
+/* ---------------- GET /health ---------------- */
+
+func TestGetHealth(t *testing.T) {
+	server := setUpTestServer()
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/health")
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var report map[string]interface{}
+	err = json.NewDecoder(resp.Body).Decode(&report)
+	assert.NoError(t, err)
+
+	assert.Contains(t, report, "overall_status")
+	assert.Contains(t, report, "summary")
+	assert.Contains(t, report, "signals")
+	assert.Contains(t, report, "recommendations")
+
+	resp.Body.Close()
+}
+
+/* ---------------- Route validation ---------------- */
 
 func TestRouteValidation(t *testing.T) {
 	server := setUpTestServer()
 	defer server.Close()
 
 	t.Run("MethodNotAllowed", func(t *testing.T) {
-		// Sending a POST request to /kv/ which only allows PUT, GET, DELETE
 		resp, err := http.Post(server.URL+"/kv/key1", "application/json", nil)
-
 		assert.NoError(t, err)
-		// This will trigger the 'default' case in your switch statement
 		assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
 	})
 }

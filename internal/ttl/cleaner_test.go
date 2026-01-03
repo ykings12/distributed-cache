@@ -2,13 +2,17 @@ package ttl
 
 import (
 	"context"
-	"distributed-cache/internal/logs"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"distributed-cache/internal/logs"
+	"distributed-cache/internal/metrics"
+
 	"github.com/stretchr/testify/assert"
 )
+
+/* ---------------- Mock Store ---------------- */
 
 type mockStore struct {
 	removed int32
@@ -18,56 +22,59 @@ func (m *mockStore) RemoveExpired() int {
 	return int(atomic.AddInt32(&m.removed, 1))
 }
 
-func TestCleanerRunOnceImplementation(t *testing.T) {
+/* ---------------- Tests ---------------- */
+
+func TestCleaner_RunOnce_RemovesExpiredAndUpdatesMetrics(t *testing.T) {
 	store := &mockStore{}
+	reg := metrics.NewRegistry()
 	logger := logs.NewLogger(10, logs.DEBUG)
 
-	cleaner := NewCleaner(store, time.Second, logger)
+	cleaner := NewCleaner(store, time.Second, logger, reg)
+
 	cleaner.runOnce()
+
 	assert.Equal(t, int32(1), atomic.LoadInt32(&store.removed))
+
+	snap := reg.Snapshot()
+	assert.Equal(t, int64(1), snap[string(metrics.TTLKeysRemovedTotal)])
 }
 
-func TestCleanerStartRunsPeriodically(t *testing.T) {
+func TestCleaner_Start_RunsPeriodicallyAndTracksRuns(t *testing.T) {
 	store := &mockStore{}
+	reg := metrics.NewRegistry()
 	logger := logs.NewLogger(10, logs.DEBUG)
 
-	cleaner := NewCleaner(store, 5*time.Millisecond, logger)
+	cleaner := NewCleaner(store, 5*time.Millisecond, logger, reg)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go cleaner.Start(ctx)
 
 	assert.Eventually(t, func() bool {
-		return atomic.LoadInt32(&store.removed) >= 2
+		snap := reg.Snapshot()
+		return snap[string(metrics.TTLCleanupRunsTotal)] >= 2
 	}, 100*time.Millisecond, 5*time.Millisecond)
 }
 
 func TestCleaner_Start_StopsOnContextCancel(t *testing.T) {
 	store := &mockStore{}
+	reg := metrics.NewRegistry()
 	logger := logs.NewLogger(10, logs.DEBUG)
 
-	cleaner := NewCleaner(store, 5*time.Millisecond, logger)
+	cleaner := NewCleaner(store, 5*time.Millisecond, logger, reg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go cleaner.Start(ctx)
 
-	// Allow cleaner to run a few times
 	time.Sleep(20 * time.Millisecond)
+	cancel()
 
-	cancel() // request shutdown
+	runsAtCancel := reg.Snapshot()[string(metrics.TTLCleanupRunsTotal)]
 
-	removedAtCancel := atomic.LoadInt32(&store.removed)
+	time.Sleep(30 * time.Millisecond)
+	runsAfter := reg.Snapshot()[string(metrics.TTLCleanupRunsTotal)]
 
-	// Give enough time that more ticks *would* have happened
-	time.Sleep(50 * time.Millisecond)
-
-	removedAfter := atomic.LoadInt32(&store.removed)
-
-	// Allow at most ONE additional run due to race with ticker
-	assert.LessOrEqual(
-		t,
-		removedAfter,
-		removedAtCancel+1,
-		"cleaner should stop shortly after context cancellation",
-	)
+	// Allow at most one extra tick due to race with ticker
+	assert.LessOrEqual(t, runsAfter, runsAtCancel+1)
 }

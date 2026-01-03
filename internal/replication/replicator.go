@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"distributed-cache/internal/logs"
+	"distributed-cache/internal/metrics"
 	"distributed-cache/internal/peers"
 	"distributed-cache/internal/store"
 )
@@ -18,23 +19,26 @@ type Replicator struct {
 	peers  *peers.PeerManager
 	config peers.PeerConfig
 
-	logger *logs.Logger
-	client *http.Client
+	logger  *logs.Logger
+	client  *http.Client
+	metrics *metrics.Registry
 }
 
 // NewReplicator creates a replication engine integrated with
-// peer health tracking and retry policies.
+// peer health tracking, retry policies, and metrics.
 func NewReplicator(
 	nodeID string,
 	peerManager *peers.PeerManager,
 	cfg peers.PeerConfig,
 	logger *logs.Logger,
+	metricsRegistry *metrics.Registry,
 ) *Replicator {
 	return &Replicator{
-		nodeID: nodeID,
-		peers:  peerManager,
-		config: cfg,
-		logger: logger,
+		nodeID:  nodeID,
+		peers:   peerManager,
+		config:  cfg,
+		logger:  logger,
+		metrics: metricsRegistry,
 		client: &http.Client{
 			Timeout: cfg.Timeout.ReplicationTimeout,
 		},
@@ -62,6 +66,8 @@ func (r *Replicator) Replicate(
 			continue
 		}
 
+		r.metrics.Inc(metrics.ReplicationAttemptsTotal)
+
 		peer := peer // capture loop variable
 		go r.sendWithRetry(ctx, peer, payload)
 	}
@@ -75,15 +81,18 @@ func (r *Replicator) sendWithRetry(
 	payload Payload,
 ) {
 	err := peers.Retry(ctx, r.config.Retry, func() error {
+		r.metrics.Inc(metrics.ReplicationRetriesTotal)
 		return r.sendOnce(ctx, peer, payload)
 	})
 
 	if err != nil {
+		r.metrics.Inc(metrics.ReplicationFailureTotal)
 		r.peers.MarkFailure(peer)
 		r.logger.Warn("replication failed to peer " + peer)
 		return
 	}
 
+	r.metrics.Inc(metrics.ReplicationSuccessTotal)
 	r.peers.MarkSuccess(peer)
 	r.logger.Debug("replication succeeded to peer " + peer)
 }

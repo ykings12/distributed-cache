@@ -3,6 +3,8 @@ package store
 import (
 	"sync"
 	"time"
+
+	"distributed-cache/internal/metrics"
 )
 
 // Store is a concurrency-safe in-memory key–value store.
@@ -16,14 +18,16 @@ import (
 // TTL testing uses short sleeps instead of injecting a clock,
 // keeping the store free of test-only concerns.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]Entry
+	mu      sync.RWMutex
+	data    map[string]Entry
+	metrics *metrics.Registry
 }
 
 // NewStore initializes and returns a new Store.
-func NewStore() *Store {
+func NewStore(metricsRegistry *metrics.Registry) *Store {
 	return &Store{
-		data: make(map[string]Entry),
+		data:    make(map[string]Entry),
+		metrics: metricsRegistry,
 	}
 }
 
@@ -36,9 +40,15 @@ func (s *Store) Set(key string, entry Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.metrics.Inc(metrics.CacheSetsTotal)
+
 	existing, exists := s.data[key]
 	if exists && entry.Timestamp <= existing.Timestamp {
 		return
+	}
+
+	if !exists {
+		s.metrics.Inc(metrics.CacheKeysTotal)
 	}
 
 	s.data[key] = entry
@@ -50,11 +60,14 @@ func (s *Store) Set(key string, entry Entry) {
 // - Returns (value, true) if key exists and is not expired
 // - If the key is expired, it is deleted and treated as missing
 func (s *Store) Get(key string) (string, bool) {
+	s.metrics.Inc(metrics.CacheGetsTotal)
+
 	s.mu.RLock()
 	entry, exists := s.data[key]
 	s.mu.RUnlock()
 
 	if !exists {
+		s.metrics.Inc(metrics.CacheMissesTotal)
 		return "", false
 	}
 
@@ -62,8 +75,13 @@ func (s *Store) Get(key string) (string, bool) {
 		s.mu.Lock()
 		delete(s.data, key)
 		s.mu.Unlock()
+
+		s.metrics.Inc(metrics.CacheExpiredTotal)
+		s.metrics.Add(metrics.CacheKeysTotal, -1)
+
 		return "", false
 	}
+
 	return entry.Value, true
 }
 
@@ -71,7 +89,11 @@ func (s *Store) Get(key string) (string, bool) {
 func (s *Store) Delete(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data, key)
+
+	if _, ok := s.data[key]; ok {
+		delete(s.data, key)
+		s.metrics.Add(metrics.CacheKeysTotal, -1)
+	}
 }
 
 // List returns a snapshot of all non-expired entries.
@@ -93,7 +115,7 @@ func (s *Store) List() map[string]Entry {
 
 // RemoveExpired removes all expired keys from the store.
 //
-// This will be used later by the background TTL cleaner.
+// This will be used by the background TTL cleaner.
 func (s *Store) RemoveExpired() int {
 	now := time.Now()
 	removed := 0
@@ -106,6 +128,11 @@ func (s *Store) RemoveExpired() int {
 			delete(s.data, k)
 			removed++
 		}
+	}
+
+	if removed > 0 {
+		s.metrics.Add(metrics.CacheExpiredTotal, int64(removed))
+		s.metrics.Add(metrics.CacheKeysTotal, -int64(removed))
 	}
 
 	return removed
